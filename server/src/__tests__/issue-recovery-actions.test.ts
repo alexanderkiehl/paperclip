@@ -28,6 +28,7 @@ import { errorHandler } from "../middleware/index.js";
 import { issueRoutes } from "../routes/issues.js";
 import { buildPaperclipWakePayload, heartbeatService } from "../services/heartbeat.js";
 import { deliverReconciledExecutions } from "../services/execution-recovery-resolution.js";
+import { getExecutionBlocker } from "../services/execution-blocker.js";
 import { issueRecoveryActionService } from "../services/issue-recovery-actions.js";
 import { recoveryService } from "../services/recovery/service.js";
 import { noticeMetadataReferencesRecoveryAction } from "../services/recovery/successful-run-handoff.js";
@@ -1648,8 +1649,8 @@ describeEmbeddedPostgres("issue recovery actions", () => {
     const body = { actionId: action!.id, outcome: "restored", sourceIssueStatus: "todo",
       executionReconciliation: { runId, providerStopped: true, actionOutcome: "not_performed",
         outcomeEvidence: "Provider receipts confirm the action was never submitted; the stopped process has no remaining effects." } };
-    // A retry without new evidence cannot clear the hold or reopen the task.
-    await request(app).post(`/api/issues/${sourceIssueId}/recovery-actions/resolve`).send({ ...body, executionReconciliation: undefined }).expect(200);
+    // A restore without proof must not reopen the hold.
+    await request(app).post(`/api/issues/${sourceIssueId}/recovery-actions/resolve`).send({ ...body, executionReconciliation: undefined }).expect(422);
     expect((await db.select().from(issues).where(eq(issues.id, sourceIssueId)))[0]!.status).toBe("blocked");
     const resolved = await request(app).post(`/api/issues/${sourceIssueId}/recovery-actions/resolve`).send(body).expect(200);
     expect(resolved.body.issue.status).toBe("todo");
@@ -2691,5 +2692,149 @@ describeEmbeddedPostgres("issue recovery actions", () => {
       .from(issueRecoveryActions)
       .where(eq(issueRecoveryActions.id, action.id));
     expect(actionRow?.status).toBe("active");
+  });
+
+  it("exposes a settled no-replay hold as the effective recovery action", async () => {
+    const { companyId, coderId, sourceIssueId } = await seedCompany();
+    const runId = randomUUID();
+    await seedHeartbeatRun({ companyId, agentId: coderId, runId, issueId: sourceIssueId, status: "failed" });
+    const [action] = await db.insert(issueRecoveryActions).values({
+      companyId, sourceIssueId, kind: "active_run_watchdog", status: "resolved", outcome: "blocked",
+      ownerType: "board", returnOwnerAgentId: coderId, cause: "uncertain_external_action", fingerprint: runId,
+      nextAction: "Preserve recorded work without replay.",
+      evidence: { runId, automaticRecovery: { replay: "blocked", actionOutcome: "unknown" } },
+    }).returning();
+    const app = createApp();
+    const list = await request(app).get(`/api/issues/${sourceIssueId}/recovery-actions`).expect(200);
+    expect(list.body.active).toBeNull();
+    expect(list.body.effective).toMatchObject({ id: action!.id, status: "resolved" });
+    expect(list.body.actions).toHaveLength(1);
+    const detail = await request(app).get(`/api/issues/${sourceIssueId}`).expect(200);
+    expect(detail.body.activeRecoveryAction).toBeNull();
+    expect(detail.body.executionBlocker).toMatchObject({
+      recoveryActionId: action!.id,
+      runId,
+    });
+    expect(detail.body.effectiveRecoveryAction).toMatchObject({ id: action!.id });
+  });
+
+  it("lets an assigned execution-recovery operator reconcile atomically and refuses ordinary agent tokens", async () => {
+    const { companyId, managerId, prefix, sourceIssueId } = await seedCompany();
+    const infraId = randomUUID();
+    const backendId = randomUUID();
+    const responsibleUserId = randomUUID();
+    await db.insert(authUsers).values({
+      id: responsibleUserId,
+      name: "Recovery operator",
+      email: `${responsibleUserId}@example.test`,
+      emailVerified: true,
+      createdAt: new Date(),
+      updatedAt: new Date(),
+    });
+    await db
+      .update(companies)
+      .set({ defaultResponsibleUserId: responsibleUserId })
+      .where(eq(companies.id, companyId));
+    await db.insert(agents).values([
+      {
+        id: infraId, companyId, name: "Infra", role: "engineer", status: "idle",
+        adapterType: "codex_local", adapterConfig: {},
+        runtimeConfig: { heartbeat: { maxConcurrentRuns: 1 } },
+        permissions: { execution_recovery_operator: true },
+      },
+      {
+        id: backendId, companyId, name: "Backend", role: "engineer", status: "idle",
+        adapterType: "codex_local", adapterConfig: {}, runtimeConfig: {}, permissions: {},
+      },
+    ]);
+    const rootRunId = randomUUID();
+    await seedHeartbeatRun({ companyId, agentId: infraId, runId: rootRunId, issueId: sourceIssueId, status: "failed" });
+    await seedHeartbeatRun({ companyId, agentId: infraId, runId: randomUUID(), status: "running" });
+    await db.update(issues).set({ status: "blocked", assigneeAgentId: infraId }).where(eq(issues.id, sourceIssueId));
+    const [rootAction] = await db.insert(issueRecoveryActions).values({
+      companyId, sourceIssueId, kind: "active_run_watchdog", status: "resolved", outcome: "blocked",
+      ownerType: "board", returnOwnerAgentId: infraId, cause: "uncertain_external_action", fingerprint: rootRunId,
+      nextAction: "Preserve recorded work without replay.",
+      evidence: { runId: rootRunId, automaticRecovery: { replay: "blocked", actionOutcome: "unknown" } },
+    }).returning();
+    const childIssueId = randomUUID();
+    await db.insert(issues).values({
+      id: childIssueId, companyId, title: "Child", status: "blocked", priority: "medium",
+      parentId: sourceIssueId, assigneeAgentId: infraId, issueNumber: 2, identifier: `${prefix}-2`,
+    });
+    const childRunId = randomUUID();
+    await db.insert(heartbeatRuns).values({
+      id: childRunId, companyId, agentId: infraId, invocationSource: "manual", status: "cancelled",
+      errorCode: "execution_reconciliation_required",
+      resultJson: { executionRecovery: { kind: "bootstrap", providerWorkStarted: false } },
+      contextSnapshot: { issueId: childIssueId },
+    });
+    const [childAction] = await db.insert(issueRecoveryActions).values({
+      companyId, sourceIssueId: childIssueId, kind: "active_run_watchdog", status: "resolved", outcome: "blocked",
+      ownerType: "board", returnOwnerAgentId: infraId, cause: "legacy_execution_requires_reconciliation",
+      fingerprint: `legacy-execution:${childRunId}`,
+      nextAction: "Inspect the stopped provider.",
+      evidence: { runId: childRunId, automaticRecovery: { replay: "blocked", actionOutcome: "unknown" } },
+    }).returning();
+    const actorRunId = randomUUID();
+    await seedHeartbeatRun({ companyId, agentId: infraId, runId: actorRunId, issueId: sourceIssueId, status: "succeeded" });
+    const ctoRunId = randomUUID();
+    await seedHeartbeatRun({ companyId, agentId: managerId, runId: ctoRunId, issueId: sourceIssueId, status: "succeeded" });
+    const backendRunId = randomUUID();
+    await seedHeartbeatRun({ companyId, agentId: backendId, runId: backendRunId, issueId: sourceIssueId, status: "succeeded" });
+    const proof = {
+      actionId: rootAction!.id, outcome: "restored", sourceIssueStatus: "todo",
+      executionReconciliation: {
+        runId: rootRunId, providerStopped: true, actionOutcome: "not_performed",
+        outcomeEvidence: "The provider never started; queued successor runs were cancelled before start.",
+      },
+    };
+    const operatorActor = {
+      type: "agent" as const,
+      agentId: infraId,
+      companyId,
+      runId: actorRunId,
+      keyScope: { kind: "standard" as const, capabilities: ["execution_recovery_operator" as const] },
+      source: "agent_jwt",
+    };
+    expect((await request(createApp({
+      type: "agent", agentId: managerId, companyId, runId: ctoRunId,
+      keyScope: { kind: "standard" }, source: "agent_jwt",
+    })).post(`/api/issues/${sourceIssueId}/recovery-actions/resolve`).send(proof)).status).toBe(403);
+    expect((await request(createApp({
+      type: "agent", agentId: backendId, companyId, runId: backendRunId,
+      keyScope: { kind: "standard" }, source: "agent_jwt",
+    })).post(`/api/issues/${sourceIssueId}/recovery-actions/resolve`).send(proof)).status).toBe(403);
+    expect((await request(createApp({
+      ...operatorActor, keyScope: { kind: "standard" },
+    })).post(`/api/issues/${sourceIssueId}/recovery-actions/resolve`).send(proof)).status).toBe(403);
+    const incomplete = await request(createApp(operatorActor))
+      .post(`/api/issues/${sourceIssueId}/recovery-actions/resolve`)
+      .send({ ...proof, executionReconciliation: undefined });
+    expect(incomplete.status).toBe(422);
+    expect((await db.select().from(issues).where(eq(issues.id, sourceIssueId)))[0]!.status).toBe("blocked");
+    expect(await getExecutionBlocker(db, companyId, sourceIssueId)).toMatchObject({
+      recoveryActionId: rootAction!.id,
+      runId: rootRunId,
+    });
+    const resolved = await request(createApp(operatorActor))
+      .post(`/api/issues/${sourceIssueId}/recovery-actions/resolve`)
+      .send(proof)
+      .expect(200);
+    expect(resolved.body.issue.status).toBe("todo");
+    expect(resolved.body.issue.executionBlocker).toBeNull();
+    expect(resolved.body.issue.effectiveRecoveryAction).toBeNull();
+    const [child] = await db.select().from(issueRecoveryActions).where(eq(issueRecoveryActions.id, childAction!.id));
+    expect(child).toMatchObject({ status: "cancelled", outcome: "cancelled" });
+    expect(child!.evidence).not.toHaveProperty("automaticRecovery");
+    expect(await getExecutionBlocker(db, companyId, sourceIssueId)).toBeNull();
+    expect(await getExecutionBlocker(db, companyId, childIssueId)).toBeNull();
+    const successors = await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.retryOfRunId, rootRunId));
+    expect(successors).toHaveLength(1);
+    const wakes = await db.select().from(agentWakeupRequests).where(
+      eq(agentWakeupRequests.idempotencyKey, `execution-reconciliation:${rootAction!.id}`),
+    );
+    expect(wakes).toHaveLength(1);
+    expect(wakes[0]!.runId).toBe(successors[0]!.id);
   });
 });

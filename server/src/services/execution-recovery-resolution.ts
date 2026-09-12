@@ -3,7 +3,7 @@ import { conversationRecoveryActionPredicate, getConversationOwnershipBlocker } 
 import { persistActivity } from "./activity-log.js";
 import { appendHeartbeatRunEvent } from "./heartbeat-run-events.js";
 import { logger } from "../middleware/logger.js";
-import { and, eq, inArray, isNull, not, or, sql } from "drizzle-orm";
+import { and, eq, inArray, isNull, ne, not, or, sql } from "drizzle-orm";
 import {
   chatActions,
   environmentLeases,
@@ -14,6 +14,7 @@ import {
   type Db,
 } from "@paperclipai/db";
 import { conflict } from "../errors.js";
+import { executionBlockerPredicate } from "./execution-blocker.js";
 import { buildExecutionContinuation } from "./execution-continuation.js";
 import {
   EXECUTION_RECONCILIATION_CAUSES,
@@ -190,6 +191,64 @@ export async function markExecutionReconciliation(
       and(
         eq(issueRecoveryActions.companyId, action.companyId),
         eq(issueRecoveryActions.id, action.id),
+      ),
+    );
+  await supersedeDescendantExecutionHolds(db, {
+    companyId: action.companyId,
+    rootIssueId: action.sourceIssueId,
+    rootActionId: action.id,
+    now: new Date(),
+  });
+}
+
+/** Cancel leftover execution holds on this issue and its descendants. */
+export async function supersedeDescendantExecutionHolds(
+  db: Db,
+  input: {
+    companyId: string;
+    rootIssueId: string;
+    rootActionId: string;
+    now: Date;
+  },
+) {
+  const issueIds = [input.rootIssueId];
+  let frontier = [input.rootIssueId];
+  for (let depth = 0; depth < 8 && frontier.length > 0; depth += 1) {
+    const children = await db
+      .select({ id: issues.id })
+      .from(issues)
+      .where(
+        and(
+          eq(issues.companyId, input.companyId),
+          inArray(issues.parentId, frontier),
+        ),
+      );
+    frontier = children
+      .map((child) => child.id)
+      .filter((id) => !issueIds.includes(id));
+    issueIds.push(...frontier);
+  }
+  const supersededNote = "Superseded by root execution reconciliation.";
+  await db
+    .update(issueRecoveryActions)
+    .set({
+      status: "cancelled",
+      outcome: "cancelled",
+      resolvedAt: input.now,
+      updatedAt: input.now,
+      resolutionNote: supersededNote,
+      nextAction: supersededNote,
+      evidence: sql`(${issueRecoveryActions.evidence} - 'automaticRecovery') || ${JSON.stringify({
+        supersededByRecoveryActionId: input.rootActionId,
+        supersededAt: input.now.toISOString(),
+      })}::jsonb`,
+    })
+    .where(
+      and(
+        eq(issueRecoveryActions.companyId, input.companyId),
+        inArray(issueRecoveryActions.sourceIssueId, issueIds),
+        ne(issueRecoveryActions.id, input.rootActionId),
+        executionBlockerPredicate(),
       ),
     );
 }
