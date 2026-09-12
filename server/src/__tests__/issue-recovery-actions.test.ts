@@ -10,6 +10,7 @@ import {
   agentWakeupRequests,
   activityLog,
   companies,
+  companyMemberships,
   createDb,
   environmentLeases,
   environments,
@@ -24,6 +25,8 @@ import {
   getEmbeddedPostgresTestSupport,
   startEmbeddedPostgresTestDatabase,
 } from "./helpers/embedded-postgres.js";
+import { createLocalAgentJwt } from "../agent-auth-jwt.js";
+import { actorMiddleware } from "../middleware/auth.js";
 import { errorHandler } from "../middleware/index.js";
 import { issueRoutes } from "../routes/issues.js";
 import { buildPaperclipWakePayload, heartbeatService } from "../services/heartbeat.js";
@@ -132,8 +135,10 @@ if (!embeddedPostgresSupport.supported) {
 describeEmbeddedPostgres("issue recovery actions", () => {
   let tempDb: Awaited<ReturnType<typeof startEmbeddedPostgresTestDatabase>> | null = null;
   let db: ReturnType<typeof createDb>;
+  const previousAgentJwtSecret = process.env.PAPERCLIP_AGENT_JWT_SECRET;
 
   beforeAll(async () => {
+    process.env.PAPERCLIP_AGENT_JWT_SECRET = "issue-recovery-actions-jwt-test-secret";
     tempDb = await startEmbeddedPostgresTestDatabase("paperclip-issue-recovery-actions-");
     db = createDb(tempDb.connectionString);
   }, 30_000);
@@ -150,12 +155,15 @@ describeEmbeddedPostgres("issue recovery actions", () => {
     await db.delete(issues);
     await db.delete(agentRuntimeState);
     await db.delete(agents);
+    await db.delete(companyMemberships);
     await db.delete(companies);
     await db.delete(authUsers);
   });
 
   afterAll(async () => {
     await tempDb?.cleanup();
+    if (previousAgentJwtSecret === undefined) delete process.env.PAPERCLIP_AGENT_JWT_SECRET;
+    else process.env.PAPERCLIP_AGENT_JWT_SECRET = previousAgentJwtSecret;
   });
 
   async function seedCompany() {
@@ -240,6 +248,36 @@ describeEmbeddedPostgres("issue recovery actions", () => {
     app.use("/api", issueRoutes(db, {} as any, opts));
     app.use(errorHandler);
     return app;
+  }
+
+  function authenticatedApp(opts: Parameters<typeof issueRoutes>[2] = {}) {
+    const app = express();
+    app.use(express.json());
+    app.use(actorMiddleware(db, { deploymentMode: "authenticated" }));
+    app.use("/api", issueRoutes(db, {} as any, opts));
+    app.use(errorHandler);
+    return app;
+  }
+
+  function agentBearer(
+    agentId: string,
+    companyId: string,
+    runId: string,
+    responsibleUserId: string,
+    capabilities: Array<"execution_recovery_operator"> = [],
+  ) {
+    const token = createLocalAgentJwt(
+      agentId,
+      companyId,
+      "codex_local",
+      runId,
+      responsibleUserId,
+      capabilities.length
+        ? { kind: "standard", capabilities }
+        : { kind: "standard" },
+    );
+    expect(token).toBeTruthy();
+    return token!;
   }
 
   it("upserts one active source-scoped action per issue and keeps company scoping explicit", async () => {
@@ -2718,7 +2756,7 @@ describeEmbeddedPostgres("issue recovery actions", () => {
     expect(detail.body.effectiveRecoveryAction).toMatchObject({ id: action!.id });
   });
 
-  it("lets an assigned execution-recovery operator reconcile atomically and refuses ordinary agent tokens", async () => {
+  async function seedOperatorReconciliation() {
     const { companyId, managerId, prefix, sourceIssueId } = await seedCompany();
     const infraId = randomUUID();
     const backendId = randomUUID();
@@ -2747,6 +2785,36 @@ describeEmbeddedPostgres("issue recovery actions", () => {
         adapterType: "codex_local", adapterConfig: {}, runtimeConfig: {}, permissions: {},
       },
     ]);
+    await db.insert(companyMemberships).values([
+      {
+        companyId,
+        principalType: "user",
+        principalId: responsibleUserId,
+        status: "active",
+        membershipRole: "operator",
+      },
+      {
+        companyId,
+        principalType: "agent",
+        principalId: infraId,
+        status: "active",
+        membershipRole: "member",
+      },
+      {
+        companyId,
+        principalType: "agent",
+        principalId: backendId,
+        status: "active",
+        membershipRole: "member",
+      },
+      {
+        companyId,
+        principalType: "agent",
+        principalId: managerId,
+        status: "active",
+        membershipRole: "member",
+      },
+    ]);
     const rootRunId = randomUUID();
     await seedHeartbeatRun({ companyId, agentId: infraId, runId: rootRunId, issueId: sourceIssueId, status: "failed" });
     await seedHeartbeatRun({ companyId, agentId: infraId, runId: randomUUID(), status: "running" });
@@ -2766,8 +2834,13 @@ describeEmbeddedPostgres("issue recovery actions", () => {
     await db.insert(heartbeatRuns).values({
       id: childRunId, companyId, agentId: infraId, invocationSource: "manual", status: "cancelled",
       errorCode: "execution_reconciliation_required",
-      resultJson: { executionRecovery: { kind: "bootstrap", providerWorkStarted: false } },
-      contextSnapshot: { issueId: childIssueId },
+      retryOfRunId: rootRunId,
+      startedAt: null,
+      resultJson: {
+        executionRecovery: { kind: "bootstrap", providerWorkStarted: false },
+        executionWait: { recoveryActionId: rootAction!.id },
+      },
+      contextSnapshot: { issueId: childIssueId, previousRunId: rootRunId },
     });
     const [childAction] = await db.insert(issueRecoveryActions).values({
       companyId, sourceIssueId: childIssueId, kind: "active_run_watchdog", status: "resolved", outcome: "blocked",
@@ -2775,6 +2848,24 @@ describeEmbeddedPostgres("issue recovery actions", () => {
       fingerprint: `legacy-execution:${childRunId}`,
       nextAction: "Inspect the stopped provider.",
       evidence: { runId: childRunId, automaticRecovery: { replay: "blocked", actionOutcome: "unknown" } },
+    }).returning();
+    const unrelatedIssueId = randomUUID();
+    const unrelatedRunId = randomUUID();
+    await db.insert(issues).values({
+      id: unrelatedIssueId, companyId, title: "Backend child", status: "blocked", priority: "medium",
+      parentId: sourceIssueId, assigneeAgentId: backendId, issueNumber: 3, identifier: `${prefix}-3`,
+    });
+    await db.insert(heartbeatRuns).values({
+      id: unrelatedRunId, companyId, agentId: backendId, invocationSource: "manual", status: "failed",
+      startedAt: new Date("2026-05-13T18:00:00.000Z"),
+      contextSnapshot: { issueId: unrelatedIssueId },
+    });
+    const [unrelatedAction] = await db.insert(issueRecoveryActions).values({
+      companyId, sourceIssueId: unrelatedIssueId, kind: "active_run_watchdog", status: "resolved", outcome: "blocked",
+      ownerType: "board", returnOwnerAgentId: backendId, cause: "uncertain_external_action",
+      fingerprint: unrelatedRunId,
+      nextAction: "Inspect the stopped provider.",
+      evidence: { runId: unrelatedRunId, automaticRecovery: { replay: "blocked", actionOutcome: "unknown" } },
     }).returning();
     const actorRunId = randomUUID();
     await seedHeartbeatRun({ companyId, agentId: infraId, runId: actorRunId, issueId: sourceIssueId, status: "succeeded" });
@@ -2789,52 +2880,119 @@ describeEmbeddedPostgres("issue recovery actions", () => {
         outcomeEvidence: "The provider never started; queued successor runs were cancelled before start.",
       },
     };
-    const operatorActor = {
-      type: "agent" as const,
-      agentId: infraId,
-      companyId,
-      runId: actorRunId,
-      keyScope: { kind: "standard" as const, capabilities: ["execution_recovery_operator" as const] },
-      source: "agent_jwt",
+    return {
+      companyId, managerId, infraId, backendId, responsibleUserId, sourceIssueId,
+      rootRunId, rootAction: rootAction!, childIssueId, childAction: childAction!,
+      unrelatedIssueId, unrelatedAction: unrelatedAction!, unrelatedRunId,
+      actorRunId, ctoRunId, backendRunId, proof,
     };
-    expect((await request(createApp({
-      type: "agent", agentId: managerId, companyId, runId: ctoRunId,
-      keyScope: { kind: "standard" }, source: "agent_jwt",
-    })).post(`/api/issues/${sourceIssueId}/recovery-actions/resolve`).send(proof)).status).toBe(403);
-    expect((await request(createApp({
-      type: "agent", agentId: backendId, companyId, runId: backendRunId,
-      keyScope: { kind: "standard" }, source: "agent_jwt",
-    })).post(`/api/issues/${sourceIssueId}/recovery-actions/resolve`).send(proof)).status).toBe(403);
-    expect((await request(createApp({
-      ...operatorActor, keyScope: { kind: "standard" },
-    })).post(`/api/issues/${sourceIssueId}/recovery-actions/resolve`).send(proof)).status).toBe(403);
-    const incomplete = await request(createApp(operatorActor))
-      .post(`/api/issues/${sourceIssueId}/recovery-actions/resolve`)
-      .send({ ...proof, executionReconciliation: undefined });
+  }
+
+  function postResolve(
+    issueId: string,
+    body: Record<string, unknown>,
+    token: string,
+    runId: string,
+  ) {
+    return request(authenticatedApp())
+      .post(`/api/issues/${issueId}/recovery-actions/resolve`)
+      .set("Authorization", `Bearer ${token}`)
+      .set("X-Paperclip-Run-Id", runId)
+      .send(body);
+  }
+
+  it("lets an assigned execution-recovery operator reconcile atomically and refuses ordinary agent tokens", async () => {
+    const fixture = await seedOperatorReconciliation();
+    const {
+      companyId, managerId, infraId, backendId, responsibleUserId, sourceIssueId,
+      rootRunId, rootAction, childIssueId, childAction,
+      unrelatedIssueId, unrelatedAction, unrelatedRunId,
+      actorRunId, ctoRunId, backendRunId, proof,
+    } = fixture;
+    const operatorToken = agentBearer(
+      infraId, companyId, actorRunId, responsibleUserId, ["execution_recovery_operator"],
+    );
+    const infraWithoutCapability = agentBearer(infraId, companyId, actorRunId, responsibleUserId);
+    const ctoToken = agentBearer(managerId, companyId, ctoRunId, responsibleUserId);
+    const backendToken = agentBearer(backendId, companyId, backendRunId, responsibleUserId);
+
+    expect((await postResolve(sourceIssueId, proof, ctoToken, ctoRunId)).status).toBe(403);
+    expect((await postResolve(sourceIssueId, proof, backendToken, backendRunId)).status).toBe(403);
+    expect((await postResolve(sourceIssueId, proof, infraWithoutCapability, actorRunId)).status).toBe(403);
+    const incomplete = await postResolve(
+      sourceIssueId, { ...proof, executionReconciliation: undefined }, operatorToken, actorRunId,
+    );
     expect(incomplete.status).toBe(422);
     expect((await db.select().from(issues).where(eq(issues.id, sourceIssueId)))[0]!.status).toBe("blocked");
     expect(await getExecutionBlocker(db, companyId, sourceIssueId)).toMatchObject({
-      recoveryActionId: rootAction!.id,
+      recoveryActionId: rootAction.id,
       runId: rootRunId,
     });
-    const resolved = await request(createApp(operatorActor))
-      .post(`/api/issues/${sourceIssueId}/recovery-actions/resolve`)
-      .send(proof)
-      .expect(200);
+    const resolved = await postResolve(sourceIssueId, proof, operatorToken, actorRunId).expect(200);
     expect(resolved.body.issue.status).toBe("todo");
     expect(resolved.body.issue.executionBlocker).toBeNull();
     expect(resolved.body.issue.effectiveRecoveryAction).toBeNull();
-    const [child] = await db.select().from(issueRecoveryActions).where(eq(issueRecoveryActions.id, childAction!.id));
+    const [child] = await db.select().from(issueRecoveryActions).where(eq(issueRecoveryActions.id, childAction.id));
     expect(child).toMatchObject({ status: "cancelled", outcome: "cancelled" });
     expect(child!.evidence).not.toHaveProperty("automaticRecovery");
     expect(await getExecutionBlocker(db, companyId, sourceIssueId)).toBeNull();
     expect(await getExecutionBlocker(db, companyId, childIssueId)).toBeNull();
+    const [unrelated] = await db.select().from(issueRecoveryActions).where(eq(issueRecoveryActions.id, unrelatedAction.id));
+    expect(unrelated).toMatchObject({ status: "resolved", outcome: "blocked" });
+    expect(unrelated!.evidence.automaticRecovery).toMatchObject({ replay: "blocked" });
+    expect(await getExecutionBlocker(db, companyId, unrelatedIssueId)).toMatchObject({
+      recoveryActionId: unrelatedAction.id,
+      runId: unrelatedRunId,
+    });
     const successors = await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.retryOfRunId, rootRunId));
-    expect(successors).toHaveLength(1);
+    const successorWakes = successors.filter((run) => run.id !== childAction.evidence.runId && run.status !== "cancelled");
+    expect(successorWakes).toHaveLength(1);
     const wakes = await db.select().from(agentWakeupRequests).where(
-      eq(agentWakeupRequests.idempotencyKey, `execution-reconciliation:${rootAction!.id}`),
+      eq(agentWakeupRequests.idempotencyKey, `execution-reconciliation:${rootAction.id}`),
     );
     expect(wakes).toHaveLength(1);
-    expect(wakes[0]!.runId).toBe(successors[0]!.id);
+    expect(wakes[0]!.runId).toBe(successorWakes[0]!.id);
+  });
+
+  it.each([
+    {
+      name: "missing outcomeEvidence",
+      patch: { outcomeEvidence: undefined },
+    },
+    {
+      name: "providerStopped false",
+      patch: { providerStopped: false },
+    },
+    {
+      name: "wrong runId",
+      patch: { runId: randomUUID() },
+    },
+  ])("rejects partial execution reconciliation proof ($name) without mutation", async ({ patch }) => {
+    const fixture = await seedOperatorReconciliation();
+    const {
+      companyId, infraId, responsibleUserId, sourceIssueId,
+      rootAction, childAction, unrelatedAction,
+      actorRunId, proof,
+    } = fixture;
+    const operatorToken = agentBearer(
+      infraId, companyId, actorRunId, responsibleUserId, ["execution_recovery_operator"],
+    );
+    const rejected = await postResolve(sourceIssueId, {
+      ...proof,
+      executionReconciliation: { ...proof.executionReconciliation, ...patch },
+    }, operatorToken, actorRunId);
+    expect(rejected.status).toBeGreaterThanOrEqual(400);
+    expect(rejected.status).toBeLessThan(500);
+    expect((await db.select().from(issues).where(eq(issues.id, sourceIssueId)))[0]!.status).toBe("blocked");
+    const [root] = await db.select().from(issueRecoveryActions).where(eq(issueRecoveryActions.id, rootAction.id));
+    expect(root).toMatchObject({ status: "resolved", outcome: "blocked" });
+    expect(root!.evidence.automaticRecovery).toMatchObject({ replay: "blocked" });
+    const [child] = await db.select().from(issueRecoveryActions).where(eq(issueRecoveryActions.id, childAction.id));
+    expect(child).toMatchObject({ status: "resolved", outcome: "blocked" });
+    const [unrelated] = await db.select().from(issueRecoveryActions).where(eq(issueRecoveryActions.id, unrelatedAction.id));
+    expect(unrelated).toMatchObject({ status: "resolved", outcome: "blocked" });
+    expect(await db.select().from(agentWakeupRequests).where(
+      eq(agentWakeupRequests.idempotencyKey, `execution-reconciliation:${rootAction.id}`),
+    )).toHaveLength(0);
   });
 });

@@ -195,39 +195,98 @@ export async function markExecutionReconciliation(
     );
   await supersedeDescendantExecutionHolds(db, {
     companyId: action.companyId,
-    rootIssueId: action.sourceIssueId,
     rootActionId: action.id,
+    rootRunId: decision.runId,
     now: new Date(),
   });
 }
 
-/** Cancel leftover execution holds on this issue and its descendants. */
+function isPreStartCancelledHoldRun(run: {
+  startedAt: Date | null;
+  resultJson: Record<string, unknown> | null;
+}): boolean {
+  if (run.startedAt) return false;
+  const recovery = run.resultJson?.executionRecovery as
+    | { providerWorkStarted?: unknown }
+    | undefined;
+  return recovery?.providerWorkStarted !== true;
+}
+
+/** Holds whose source run descends from the reconciled run and never started provider work. */
+async function findPreStartDescendantRunIds(
+  db: Db,
+  input: { companyId: string; rootRunId: string; rootActionId: string },
+): Promise<string[]> {
+  const eligible = new Set<string>();
+  const seen = new Set<string>([input.rootRunId]);
+  let frontier = [input.rootRunId];
+  for (let depth = 0; depth < 64 && frontier.length > 0; depth += 1) {
+    const children = await db
+      .select({
+        id: heartbeatRuns.id,
+        startedAt: heartbeatRuns.startedAt,
+        resultJson: heartbeatRuns.resultJson,
+      })
+      .from(heartbeatRuns)
+      .where(
+        and(
+          eq(heartbeatRuns.companyId, input.companyId),
+          or(
+            inArray(heartbeatRuns.retryOfRunId, frontier),
+            sql`${heartbeatRuns.contextSnapshot}->>'previousRunId' in (${sql.join(
+              frontier.map((id) => sql`${id}`),
+              sql`, `,
+            )})`,
+            sql`${heartbeatRuns.contextSnapshot}->>'retryOfRunId' in (${sql.join(
+              frontier.map((id) => sql`${id}`),
+              sql`, `,
+            )})`,
+          ),
+        ),
+      );
+    const next: string[] = [];
+    for (const child of children) {
+      if (seen.has(child.id)) continue;
+      seen.add(child.id);
+      next.push(child.id);
+      if (isPreStartCancelledHoldRun(child)) eligible.add(child.id);
+    }
+    frontier = next;
+  }
+  const cancelledByHold = await db
+    .select({
+      id: heartbeatRuns.id,
+      startedAt: heartbeatRuns.startedAt,
+      resultJson: heartbeatRuns.resultJson,
+    })
+    .from(heartbeatRuns)
+    .where(
+      and(
+        eq(heartbeatRuns.companyId, input.companyId),
+        eq(heartbeatRuns.errorCode, "execution_reconciliation_required"),
+        isNull(heartbeatRuns.startedAt),
+        sql`${heartbeatRuns.resultJson}->'executionWait'->>'recoveryActionId' = ${input.rootActionId}`,
+      ),
+    );
+  for (const run of cancelledByHold) {
+    if (run.id === input.rootRunId) continue;
+    if (isPreStartCancelledHoldRun(run)) eligible.add(run.id);
+  }
+  return [...eligible];
+}
+
+/** Cancel leftover pre-start execution holds that descend from the reconciled run. */
 export async function supersedeDescendantExecutionHolds(
   db: Db,
   input: {
     companyId: string;
-    rootIssueId: string;
     rootActionId: string;
+    rootRunId: string;
     now: Date;
   },
 ) {
-  const issueIds = [input.rootIssueId];
-  let frontier = [input.rootIssueId];
-  for (let depth = 0; depth < 8 && frontier.length > 0; depth += 1) {
-    const children = await db
-      .select({ id: issues.id })
-      .from(issues)
-      .where(
-        and(
-          eq(issues.companyId, input.companyId),
-          inArray(issues.parentId, frontier),
-        ),
-      );
-    frontier = children
-      .map((child) => child.id)
-      .filter((id) => !issueIds.includes(id));
-    issueIds.push(...frontier);
-  }
+  const descendantRunIds = await findPreStartDescendantRunIds(db, input);
+  if (descendantRunIds.length === 0) return;
   const supersededNote = "Superseded by root execution reconciliation.";
   await db
     .update(issueRecoveryActions)
@@ -246,9 +305,12 @@ export async function supersedeDescendantExecutionHolds(
     .where(
       and(
         eq(issueRecoveryActions.companyId, input.companyId),
-        inArray(issueRecoveryActions.sourceIssueId, issueIds),
         ne(issueRecoveryActions.id, input.rootActionId),
         executionBlockerPredicate(),
+        sql`coalesce(${issueRecoveryActions.evidence}->>'runId', ${issueRecoveryActions.evidence}->>'sourceRunId') in (${sql.join(
+          descendantRunIds.map((id) => sql`${id}`),
+          sql`, `,
+        )})`,
       ),
     );
 }
